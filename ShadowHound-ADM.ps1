@@ -343,11 +343,18 @@ function ShadowHound-ADM {
                     continue
                 }
                 
-                # Skip already completed containers from state file
+                # Skip already completed containers from state file (unless they have failed letters)
                 if ($stateEnabled -and $stateData -and $stateData.completedContainers -contains $containerDN) {
-                    Write-Output "[+] Container $containerDN already completed, skipping..."
-                    $processedContainers += $containerDN
-                    continue
+                    # Check if this container has failed letters that need retry
+                    $hasFailedLetters = $stateData.failedLetters -and $stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN].Count -gt 0
+                    if (-not $hasFailedLetters) {
+                        Write-Output "[+] Container $containerDN already completed, skipping..."
+                        $processedContainers += $containerDN
+                        continue
+                    }
+                    else {
+                        Write-Output "[*] Container $containerDN has failed letters to retry..."
+                    }
                 }
 
                 # Check if this container is being retried from a previous failure
@@ -406,7 +413,159 @@ function ShadowHound-ADM {
                     # Full charset for 2-letter and 3-letter splits includes . and - for edge cases
                     $charsetFull = $charset + '.', '-'
                     $OriginalFilter = $containerSearchParams['LdapFilter']
+
+                    # Check if this container has failed letters to retry (from previous run)
+                    $failedLettersForContainer = @()
+                    if ($stateEnabled -and $stateData -and $stateData.failedLetters -and $stateData.failedLetters.ContainsKey($containerDN)) {
+                        $failedLettersForContainer = @($stateData.failedLetters[$containerDN])
+                    }
+
+                    # If we have failed letters, ONLY retry those - don't process all letters again
+                    if ($failedLettersForContainer.Count -gt 0) {
+                        Write-Output "  [*] Retrying $($failedLettersForContainer.Count) failed letter(s): $($failedLettersForContainer -join ', ')"
+
+                        foreach ($failedLetter in $failedLettersForContainer) {
+                            Write-Output "  [*] Retrying failed letter '$failedLetter' for $containerDN"
+
+                            try {
+                                $containerSearchParams['LdapFilter'] = "(&$OriginalFilter(cn=$failedLetter*))"
+                                Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+
+                                # Success - remove from failed letters
+                                if ($stateEnabled -and $stateData) {
+                                    $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $failedLetter })
+                                    if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                        $stateData.failedLetters.Remove($containerDN)
+                                    }
+                                    $stateData.objectCount = $count.Value
+                                    Write-StateFile -State $stateData -Path $statePath
+                                }
+                            }
+                            catch {
+                                Write-Output "   [-] Failed to process (CN=$failedLetter*) for container '$containerDN': $_"
+                                Write-Output '       Trying to split to 3-letter prefixes...'
+
+                                $batchSize = 4
+                                $tripleSuccess = $false
+                                $failedBatches = @()
+
+                                for ($batchIdx = 0; $batchIdx -lt $charsetFull.Length; $batchIdx += $batchSize) {
+                                    $batchEnd = [Math]::Min($batchIdx + $batchSize - 1, $charsetFull.Length - 1)
+                                    $batch = $charsetFull[$batchIdx..$batchEnd]
+
+                                    $orFilters = @()
+                                    foreach ($tripleChar in $batch) {
+                                        $triplePrefix = "$failedLetter$tripleChar"
+                                        $orFilters += "(cn=$triplePrefix*)"
+                                    }
+
+                                    $batchFilter = "(&$OriginalFilter(|$($orFilters -join '')))"
+                                    $batchNames = ($batch | ForEach-Object { "$failedLetter$_" }) -join ', '
+
+                                    try {
+                                        Write-Output "    [*] Querying batch: $batchNames"
+                                        $containerSearchParams['LdapFilter'] = $batchFilter
+                                        Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+                                        $tripleSuccess = $true
+
+                                        if ($stateEnabled -and $stateData) {
+                                            foreach ($tripleChar in $batch) {
+                                                $triplePrefix = "$failedLetter$tripleChar"
+                                                if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $triplePrefix) {
+                                                    $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $triplePrefix })
+                                                    if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                        $stateData.failedLetters.Remove($containerDN)
+                                                    }
+                                                }
+                                            }
+                                            $stateData.objectCount = $count.Value
+                                            Write-StateFile -State $stateData -Path $statePath
+                                        }
+                                    }
+                                    catch {
+                                        Write-Output "    [-] Batch failed - will retry individually"
+                                        if ($stateEnabled -and $stateData) {
+                                            if (-not $stateData.failedLetters[$containerDN]) {
+                                                $stateData.failedLetters[$containerDN] = @()
+                                            }
+                                            foreach ($tripleChar in $batch) {
+                                                $triplePrefix = "$failedLetter$tripleChar"
+                                                if ($stateData.failedLetters[$containerDN] -notcontains $triplePrefix) {
+                                                    $stateData.failedLetters[$containerDN] += $triplePrefix
+                                                }
+                                            }
+                                            $stateData.objectCount = $count.Value
+                                            Write-StateFile -State $stateData -Path $statePath
+                                        }
+                                        $failedBatches += , @($batch)
+                                    }
+                                }
+
+                                foreach ($batch in $failedBatches) {
+                                    foreach ($tripleChar in $batch) {
+                                        $triplePrefix = "$failedLetter$tripleChar"
+                                        try {
+                                            Write-Output "    [*] Querying $containerDN for CN starting with '$triplePrefix'"
+                                            $containerSearchParams['LdapFilter'] = "(&$OriginalFilter(cn=$triplePrefix*))"
+                                            Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+                                            $tripleSuccess = $true
+
+                                            if ($stateEnabled -and $stateData) {
+                                                if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $triplePrefix) {
+                                                    $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $triplePrefix })
+                                                    if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                        $stateData.failedLetters.Remove($containerDN)
+                                                    }
+                                                }
+                                                $stateData.objectCount = $count.Value
+                                                Write-StateFile -State $stateData -Path $statePath
+                                            }
+                                        }
+                                        catch {
+                                            Write-Output "    [-] Failed to process (CN=$triplePrefix*): $_"
+                                            if ($stateEnabled -and $stateData) {
+                                                if (-not $stateData.failedLetters[$containerDN]) {
+                                                    $stateData.failedLetters[$containerDN] = @()
+                                                }
+                                                if ($stateData.failedLetters[$containerDN] -notcontains $triplePrefix) {
+                                                    $stateData.failedLetters[$containerDN] += $triplePrefix
+                                                }
+                                                $stateData.objectCount = $count.Value
+                                                Write-StateFile -State $stateData -Path $statePath
+                                            }
+                                            continue
+                                        }
+                                    }
+                                }
+
+                                # Remove 2-letter from failed if 3-letter succeeded
+                                if ($tripleSuccess -and $stateEnabled -and $stateData) {
+                                    if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $failedLetter) {
+                                        $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $failedLetter })
+                                        if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                            $stateData.failedLetters.Remove($containerDN)
+                                        }
+                                        Write-StateFile -State $stateData -Path $statePath
+                                    }
+                                }
+                            }
+                        }
+
+                        # After retrying failed letters, mark container complete if no failures remain
+                        $processedContainers += $containerDN
+                        $isFirstContainer = $false
+
+                        if ($stateEnabled -and $stateData) {
+                            $stillHasFailedLetters = $stateData.failedLetters -and $stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN].Count -gt 0
+                            if (-not $stillHasFailedLetters -and -not ($stateData.completedContainers -contains $containerDN)) {
+                                $stateData.completedContainers += $containerDN
+                            }
+                            Write-StateFile -State $stateData -Path $statePath
+                        }
+                        continue
+                    }
                     
+                    # Normal processing - no failed letters to retry
                     # Determine starting letter for this container
                     $startIdx = 0
                     if ($stateEnabled -and $stateData -and $stateData.currentContainer -eq $containerDN -and $stateData.completedLetters) {
@@ -502,10 +661,121 @@ function ShadowHound-ADM {
                                     }
                                 }
                                 catch {
-                                    Write-Output "   [-] Failed to process (CN=$doubleChar*) for container '$containerDN': $_`nMoving to the next sub letter..."
-                                    
-                                    # Track failed letter for this container
-                                    if ($stateEnabled -and $stateData) {
+                                    Write-Output "   [-] Failed to process (CN=$doubleChar*) for container '$containerDN': $_"
+                                    Write-Output '       Trying to split to 3-letter prefixes...'
+
+                                    $batchSize = 4
+                                    $tripleSuccess = $false
+                                    $failedBatches = @()
+
+                                    for ($batchIdx = 0; $batchIdx -lt $charsetFull.Length; $batchIdx += $batchSize) {
+                                        $batchEnd = [Math]::Min($batchIdx + $batchSize - 1, $charsetFull.Length - 1)
+                                        $batch = $charsetFull[$batchIdx..$batchEnd]
+
+                                        $orFilters = @()
+                                        foreach ($tripleChar in $batch) {
+                                            $triplePrefix = "$doubleChar$tripleChar"
+                                            $orFilters += "(cn=$triplePrefix*)"
+                                        }
+
+                                        $batchFilter = "(&$OriginalFilter(|$($orFilters -join '')))"
+                                        $batchNames = ($batch | ForEach-Object { "$doubleChar$_" }) -join ', '
+
+                                        try {
+                                            Write-Output "    [*] Querying batch: $batchNames"
+                                            $containerSearchParams['LdapFilter'] = $batchFilter
+                                            Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+                                            $tripleSuccess = $true
+
+                                            if ($stateEnabled -and $stateData) {
+                                                foreach ($tripleChar in $batch) {
+                                                    $triplePrefix = "$doubleChar$tripleChar"
+                                                    if (-not ($stateData.completedLetters -contains $triplePrefix)) {
+                                                        $stateData.completedLetters += $triplePrefix
+                                                    }
+                                                    if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $triplePrefix })
+                                                        if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                            $stateData.failedLetters.Remove($containerDN)
+                                                        }
+                                                    }
+                                                }
+                                                $stateData.currentContainer = $containerDN
+                                                $stateData.objectCount = $count.Value
+                                                Write-StateFile -State $stateData -Path $statePath
+                                            }
+                                        }
+                                        catch {
+                                            Write-Output "    [-] Batch failed - will retry individually"
+                                            if ($stateEnabled -and $stateData) {
+                                                if (-not $stateData.failedLetters[$containerDN]) {
+                                                    $stateData.failedLetters[$containerDN] = @()
+                                                }
+                                                foreach ($tripleChar in $batch) {
+                                                    $triplePrefix = "$doubleChar$tripleChar"
+                                                    if ($stateData.failedLetters[$containerDN] -notcontains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] += $triplePrefix
+                                                    }
+                                                }
+                                                $stateData.objectCount = $count.Value
+                                                Write-StateFile -State $stateData -Path $statePath
+                                            }
+                                            $failedBatches += , @($batch)
+                                        }
+                                    }
+
+                                    foreach ($batch in $failedBatches) {
+                                        foreach ($tripleChar in $batch) {
+                                            $triplePrefix = "$doubleChar$tripleChar"
+                                            try {
+                                                Write-Output "    [*] Querying $containerDN for CN starting with '$triplePrefix'"
+                                                $containerSearchParams['LdapFilter'] = "(&$OriginalFilter(cn=$triplePrefix*))"
+                                                Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+                                                $tripleSuccess = $true
+
+                                                if ($stateEnabled -and $stateData) {
+                                                    if (-not ($stateData.completedLetters -contains $triplePrefix)) {
+                                                        $stateData.completedLetters += $triplePrefix
+                                                    }
+                                                    if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $triplePrefix })
+                                                        if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                            $stateData.failedLetters.Remove($containerDN)
+                                                        }
+                                                    }
+                                                    $stateData.currentContainer = $containerDN
+                                                    $stateData.objectCount = $count.Value
+                                                    Write-StateFile -State $stateData -Path $statePath
+                                                }
+                                            }
+                                            catch {
+                                                Write-Output "    [-] Failed to process (CN=$triplePrefix*): $_"
+                                                if ($stateEnabled -and $stateData) {
+                                                    if (-not $stateData.failedLetters[$containerDN]) {
+                                                        $stateData.failedLetters[$containerDN] = @()
+                                                    }
+                                                    if ($stateData.failedLetters[$containerDN] -notcontains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] += $triplePrefix
+                                                    }
+                                                    $stateData.objectCount = $count.Value
+                                                    Write-StateFile -State $stateData -Path $statePath
+                                                }
+                                                continue
+                                            }
+                                        }
+                                    }
+
+                                    # Remove 2-letter from failed if 3-letter succeeded
+                                    if ($tripleSuccess -and $stateEnabled -and $stateData) {
+                                        if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $doubleChar) {
+                                            $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $doubleChar })
+                                            if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                $stateData.failedLetters.Remove($containerDN)
+                                            }
+                                            Write-StateFile -State $stateData -Path $statePath
+                                        }
+                                    }
+                                    elseif (-not $tripleSuccess -and $stateEnabled -and $stateData) {
                                         if (-not $stateData.failedLetters[$containerDN]) {
                                             $stateData.failedLetters[$containerDN] = @()
                                         }
@@ -520,7 +790,7 @@ function ShadowHound-ADM {
                             }
                             continue
                         }
-                        
+
                         Write-Output "  [*] Querying $containerDN for objects with CN starting with '$charStr'"
                         $containerSearchParams['LdapFilter'] = "(&$OriginalFilter(cn=$charStr*))"
 
@@ -576,10 +846,121 @@ function ShadowHound-ADM {
                                     }
                                 }
                                 catch {
-                                    Write-Output "   [-] Failed to process (CN=$doubleChar*) for container '$containerDN': $_`nMoving to the next sub letter..."
-                                    
-                                    # Track failed letter for this container
-                                    if ($stateEnabled -and $stateData) {
+                                    Write-Output "   [-] Failed to process (CN=$doubleChar*) for container '$containerDN': $_"
+                                    Write-Output '       Trying to split to 3-letter prefixes...'
+
+                                    $batchSize = 4
+                                    $tripleSuccess = $false
+                                    $failedBatches = @()
+
+                                    for ($batchIdx = 0; $batchIdx -lt $charsetFull.Length; $batchIdx += $batchSize) {
+                                        $batchEnd = [Math]::Min($batchIdx + $batchSize - 1, $charsetFull.Length - 1)
+                                        $batch = $charsetFull[$batchIdx..$batchEnd]
+
+                                        $orFilters = @()
+                                        foreach ($tripleChar in $batch) {
+                                            $triplePrefix = "$doubleChar$tripleChar"
+                                            $orFilters += "(cn=$triplePrefix*)"
+                                        }
+
+                                        $batchFilter = "(&$OriginalFilter(|$($orFilters -join '')))"
+                                        $batchNames = ($batch | ForEach-Object { "$doubleChar$_" }) -join ', '
+
+                                        try {
+                                            Write-Output "    [*] Querying batch: $batchNames"
+                                            $containerSearchParams['LdapFilter'] = $batchFilter
+                                            Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+                                            $tripleSuccess = $true
+
+                                            if ($stateEnabled -and $stateData) {
+                                                foreach ($tripleChar in $batch) {
+                                                    $triplePrefix = "$doubleChar$tripleChar"
+                                                    if (-not ($stateData.completedLetters -contains $triplePrefix)) {
+                                                        $stateData.completedLetters += $triplePrefix
+                                                    }
+                                                    if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $triplePrefix })
+                                                        if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                            $stateData.failedLetters.Remove($containerDN)
+                                                        }
+                                                    }
+                                                }
+                                                $stateData.currentContainer = $containerDN
+                                                $stateData.objectCount = $count.Value
+                                                Write-StateFile -State $stateData -Path $statePath
+                                            }
+                                        }
+                                        catch {
+                                            Write-Output "    [-] Batch failed - will retry individually"
+                                            if ($stateEnabled -and $stateData) {
+                                                if (-not $stateData.failedLetters[$containerDN]) {
+                                                    $stateData.failedLetters[$containerDN] = @()
+                                                }
+                                                foreach ($tripleChar in $batch) {
+                                                    $triplePrefix = "$doubleChar$tripleChar"
+                                                    if ($stateData.failedLetters[$containerDN] -notcontains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] += $triplePrefix
+                                                    }
+                                                }
+                                                $stateData.objectCount = $count.Value
+                                                Write-StateFile -State $stateData -Path $statePath
+                                            }
+                                            $failedBatches += , @($batch)
+                                        }
+                                    }
+
+                                    foreach ($batch in $failedBatches) {
+                                        foreach ($tripleChar in $batch) {
+                                            $triplePrefix = "$doubleChar$tripleChar"
+                                            try {
+                                                Write-Output "    [*] Querying $containerDN for CN starting with '$triplePrefix'"
+                                                $containerSearchParams['LdapFilter'] = "(&$OriginalFilter(cn=$triplePrefix*))"
+                                                Perform-ADQuery -SearchParams $containerSearchParams -StreamWriter $streamWriter -Count $count -PrintingThreshold $printingThreshold
+                                                $tripleSuccess = $true
+
+                                                if ($stateEnabled -and $stateData) {
+                                                    if (-not ($stateData.completedLetters -contains $triplePrefix)) {
+                                                        $stateData.completedLetters += $triplePrefix
+                                                    }
+                                                    if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $triplePrefix })
+                                                        if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                            $stateData.failedLetters.Remove($containerDN)
+                                                        }
+                                                    }
+                                                    $stateData.currentContainer = $containerDN
+                                                    $stateData.objectCount = $count.Value
+                                                    Write-StateFile -State $stateData -Path $statePath
+                                                }
+                                            }
+                                            catch {
+                                                Write-Output "    [-] Failed to process (CN=$triplePrefix*): $_"
+                                                if ($stateEnabled -and $stateData) {
+                                                    if (-not $stateData.failedLetters[$containerDN]) {
+                                                        $stateData.failedLetters[$containerDN] = @()
+                                                    }
+                                                    if ($stateData.failedLetters[$containerDN] -notcontains $triplePrefix) {
+                                                        $stateData.failedLetters[$containerDN] += $triplePrefix
+                                                    }
+                                                    $stateData.objectCount = $count.Value
+                                                    Write-StateFile -State $stateData -Path $statePath
+                                                }
+                                                continue
+                                            }
+                                        }
+                                    }
+
+                                    # Remove 2-letter from failed if 3-letter succeeded
+                                    if ($tripleSuccess -and $stateEnabled -and $stateData) {
+                                        if ($stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN] -contains $doubleChar) {
+                                            $stateData.failedLetters[$containerDN] = @($stateData.failedLetters[$containerDN] | Where-Object { $_ -ne $doubleChar })
+                                            if ($stateData.failedLetters[$containerDN].Count -eq 0) {
+                                                $stateData.failedLetters.Remove($containerDN)
+                                            }
+                                            Write-StateFile -State $stateData -Path $statePath
+                                        }
+                                    }
+                                    elseif (-not $tripleSuccess -and $stateEnabled -and $stateData) {
                                         if (-not $stateData.failedLetters[$containerDN]) {
                                             $stateData.failedLetters[$containerDN] = @()
                                         }
@@ -597,9 +978,13 @@ function ShadowHound-ADM {
 
                     $processedContainers += $containerDN
                     $isFirstContainer = $false
-                    
+
+                    # Only mark container as completed if it has no failed letters
                     if ($stateEnabled -and $stateData) {
-                        $stateData.completedContainers += $containerDN
+                        $hasFailedLettersForContainer = $stateData.failedLetters -and $stateData.failedLetters.ContainsKey($containerDN) -and $stateData.failedLetters[$containerDN].Count -gt 0
+                        if (-not $hasFailedLettersForContainer -and -not ($stateData.completedContainers -contains $containerDN)) {
+                            $stateData.completedContainers += $containerDN
+                        }
                         $stateData.completedLetters = @()
                         $stateData.currentContainer = $null
                         Write-StateFile -State $stateData -Path $statePath
