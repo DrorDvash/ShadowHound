@@ -134,3 +134,6 @@ For large JSON files (>100MB), consider splitting them with tools like [ShredHou
 - **Yehuda Smirnov**
   - Twitter: [@yudasm_](https://twitter.com/yudasm_)
   - BlueSky: [@yudasm.bsky.social](https://bsky.app/profile/yudasm.bsky.social)
+ 
+## Contributors
+- [DrorDvash](https://github.com/DrorDvash) - For Resumable Enumeration and 3-Letter Splitting [PR#6](https://github.com/Friends-Security/ShadowHound/pull/6) 
