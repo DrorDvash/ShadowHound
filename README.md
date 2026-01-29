@@ -89,7 +89,7 @@ ShadowHound-ADM -OutputFilePath "C:\Results\ldap_output.txt" -SplitSearch -Lette
 
 ### Resumable Enumeration (ShadowHound-ADM.ps1)
 
-Enumeration automatically saves progress. If interrupted (network drop, Ctrl+C, session killed), just run the same command again - it picks up where it left off.
+Enumeration automatically saves ogress. If interrupted (network drop, Ctrl+C, session killed), just run the same command again - it picks up where it left off.
 
 ```powershell
 # Start enumeration
@@ -104,10 +104,10 @@ ShadowHound-ADM -Server dc.corp.local -OutputFilePath output.txt -LetterSplitSea
 **New parameters:**
 - **`-DisableStateFile`**: No checkpoints (OPSEC - no artifacts)
 - **`-StartFromLetter <char>`**: Skip ahead (e.g. `-StartFromLetter "m"`)
-- **`-KeepStateFile`**: Preserve state file after completion
+- **`-KeepStateFile`**: eserve state file after completion
 - **`-StateFile <path>`**: Custom state file location
 
-For more details on resumable enumeration and 3-letter splitting, see the [feature PR](https://github.com/Friends-Security/ShadowHound/pull/4).
+For more details on resumable enumeration and 3-letter splitting, see the [feature PR](https://github.com/Friends-Security/ShadowHound/pull/6).
 
 ## Converting Data for BloodHound
 
